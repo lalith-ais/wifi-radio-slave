@@ -1,0 +1,19 @@
+menu "WiFi Radio Block Configuration"
+
+    config WIFI_SSID
+        string "WiFi SSID"
+        default "myssid"
+        help
+            Bench-test fallback SSID. TODO next stage: superseded by the
+            SPIFFS-backed single-SSID config store (WIFI.SET over the
+            serial CLI) once that lands - this Kconfig value only matters
+            until then.
+
+    config WIFI_PASSWORD
+        string "WiFi Password"
+        default "mypassword"
+        help
+            Bench-test fallback password. See WIFI_SSID above - same
+            caveat applies.
+
+endmenu
