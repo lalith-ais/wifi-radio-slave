@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "wifi_mgr.c" "stream_player.c" "cli.c" "i2s_out.c"
+idf_component_register(SRCS "main.c" "wifi_mgr.c" "stream_player.c" "cli.c" "i2s_out.c" "icy_meta.c"
                        INCLUDE_DIRS "."
                        REQUIRES esp_timer esp_wifi esp_http_client esp_audio_codec nvs_flash mbedtls driver)
 

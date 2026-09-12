@@ -20,6 +20,7 @@
 #include "stream_player.h"
 #include "cli.h"
 #include "i2s_out.h"
+#include "icy_meta.h"
 
 static const char *TAG = "stream_player";
 
@@ -135,14 +136,90 @@ static stream_format_t sniff_stream_format(const uint8_t *data, size_t len)
     return STREAM_FMT_UNKNOWN;
 }
 
+/*
+ * Finds the byte offset of the next valid frame sync word for `fmt` in
+ * `data`, or -1 if none is found in this buffer. Used to resynchronize
+ * after a decode error: the decoder tells us it failed but not how many
+ * bytes of the input it actually consumed first, so simply resuming at
+ * the next network read's arbitrary starting byte is not guaranteed to
+ * land on a frame boundary - feeding it mid-frame produces garbage
+ * header fields (e.g. a bogus channel count) and reliably fails again,
+ * cascading into repeated near-instant failures. Scanning for a real
+ * sync word before resuming breaks that cascade.
+ */
+static int find_sync_word(const uint8_t *data, size_t len, stream_format_t fmt)
+{
+    for (size_t i = 0; i + 1 < len; i++) {
+        if (data[i] != 0xFF) {
+            continue;
+        }
+        uint8_t b1 = data[i + 1];
+        if (fmt == STREAM_FMT_AAC && (b1 & 0xF0) == 0xF0) {
+            return (int)i;
+        }
+        if (fmt == STREAM_FMT_MP3 && (b1 & 0xE0) == 0xE0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
 static void set_stats_locked(player_state_t state, const player_stats_t *merge)
 {
     xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
     if (merge != NULL) {
-        s_stats = *merge;
+        /* Copy only the decode-related fields the caller actually sets -
+         * NOT a whole-struct assignment, which would wipe the ICY
+         * station_name/genre/bitrate/now_playing fields back to zero on
+         * every periodic status snapshot (they're populated separately,
+         * by set_station_info_locked() / on_icy_title()). */
+        s_stats.current_index = merge->current_index;
+        strncpy(s_stats.current_name, merge->current_name, sizeof(s_stats.current_name) - 1);
+        s_stats.sample_rate = merge->sample_rate;
+        s_stats.channels = merge->channels;
+        s_stats.bits_per_sample = merge->bits_per_sample;
+        s_stats.cpu_pct = merge->cpu_pct;
+        s_stats.buffer_pct = merge->buffer_pct;
     }
     s_stats.state = state;
     xSemaphoreGive(s_stats_mutex);
+}
+
+/* Station-level ICY headers - static for the life of one connection.
+ * Also clears now_playing, since a fresh connection means no in-stream
+ * title has arrived yet for it. */
+static void set_station_info_locked(const char *name, const char *genre, int bitrate_kbps)
+{
+    xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
+    strncpy(s_stats.station_name, name ? name : "", sizeof(s_stats.station_name) - 1);
+    strncpy(s_stats.station_genre, genre ? genre : "", sizeof(s_stats.station_genre) - 1);
+    s_stats.station_bitrate_kbps = bitrate_kbps;
+    s_stats.now_playing[0] = '\0';
+    xSemaphoreGive(s_stats_mutex);
+}
+
+/* icy_meta_cb_t callback - fires whenever a StreamTitle metadata block
+ * is parsed out of the stream. Updates the shared now_playing field and
+ * emits it as an async event so a listening CLI client sees song
+ * changes in real time, not just on the next STATUS/STREAMINFO poll. */
+static void on_icy_title(const char *stream_title, void *user_ctx)
+{
+    (void)user_ctx;
+    xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
+    /* Some stations repeat the identical StreamTitle in every metadata
+     * block (especially ones with a short metaint, e.g. every ~0.5s of
+     * audio) rather than only sending it on an actual song change. Only
+     * fire the event - and only log it - when it's genuinely new. */
+    bool changed = strncmp(s_stats.now_playing, stream_title, sizeof(s_stats.now_playing) - 1) != 0;
+    if (changed) {
+        strncpy(s_stats.now_playing, stream_title, sizeof(s_stats.now_playing) - 1);
+        s_stats.now_playing[sizeof(s_stats.now_playing) - 1] = '\0';
+    }
+    xSemaphoreGive(s_stats_mutex);
+
+    if (changed) {
+        cli_event(620, "now playing %s", stream_title);
+    }
 }
 
 /* Feeds one buffer's worth of compressed bytes through the decoder;
@@ -185,10 +262,12 @@ static esp_audio_err_t feed_decode_buffer(esp_audio_simple_dec_handle_t decoder,
 
             if (!*info_captured) {
                 esp_audio_simple_dec_get_info(decoder, info);
+                const char *profile_str = (fmt == STREAM_FMT_AAC) ? classify_profile(adts, info) : "MP3";
                 ESP_LOGI(TAG, "Decoded stream info: %d Hz, %d ch, %d bps",
                           info->sample_rate, info->channel, info->bits_per_sample);
-                ESP_LOGI(TAG, "Classified as: %s",
-                          fmt == STREAM_FMT_AAC ? classify_profile(adts, info) : "MP3");
+                ESP_LOGI(TAG, "Classified as: %s", profile_str);
+                cli_event(616, "format %s %dhz %dch %dbit",
+                          profile_str, info->sample_rate, info->channel, info->bits_per_sample);
                 *info_captured = true;
             }
 
@@ -210,6 +289,44 @@ static esp_audio_err_t feed_decode_buffer(esp_audio_simple_dec_handle_t decoder,
     return ESP_AUDIO_ERR_OK;
 }
 
+/*
+ * esp_http_client_get_header() proved unreliable in our open/
+ * fetch_headers/read usage pattern: response headers were confirmed
+ * present via HTTP_EVENT_ON_HEADER (icy-metaint, icy-name, etc. all
+ * arrive correctly) yet get_header() returned nothing for any of them.
+ * Rather than chase why, we capture the handful of headers we actually
+ * need directly in the event callback, which is proven to see every
+ * header correctly as it streams in.
+ */
+typedef struct {
+    char content_type[64];
+    int icy_metaint;
+    char icy_name[64];
+    char icy_genre[32];
+    int icy_br;
+} http_headers_t;
+
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    if (evt->event_id != HTTP_EVENT_ON_HEADER || evt->user_data == NULL
+        || evt->header_key == NULL || evt->header_value == NULL) {
+        return ESP_OK;
+    }
+    http_headers_t *h = (http_headers_t *)evt->user_data;
+    if (strcasecmp(evt->header_key, "Content-Type") == 0) {
+        strncpy(h->content_type, evt->header_value, sizeof(h->content_type) - 1);
+    } else if (strcasecmp(evt->header_key, "icy-metaint") == 0) {
+        h->icy_metaint = atoi(evt->header_value);
+    } else if (strcasecmp(evt->header_key, "icy-name") == 0) {
+        strncpy(h->icy_name, evt->header_value, sizeof(h->icy_name) - 1);
+    } else if (strcasecmp(evt->header_key, "icy-genre") == 0) {
+        strncpy(h->icy_genre, evt->header_value, sizeof(h->icy_genre) - 1);
+    } else if (strcasecmp(evt->header_key, "icy-br") == 0) {
+        h->icy_br = atoi(evt->header_value);
+    }
+    return ESP_OK;
+}
+
 /* --- Stream decode for one playlist entry --- */
 static void play_one(const play_request_t *req)
 {
@@ -221,6 +338,8 @@ static void play_one(const play_request_t *req)
     set_stats_locked(PLAYER_STATE_BUFFERING, NULL);
 
     ESP_LOGI(TAG, "Opening stream: %s", req->url);
+
+    http_headers_t hdrs = {0};
 
     esp_http_client_config_t http_cfg = {
         .url = req->url,
@@ -235,6 +354,8 @@ static void play_one(const play_request_t *req)
          * open()/fetch_headers()/read(), so auto-redirect is disabled to
          * avoid any ambiguity with that manual handling. */
         .disable_auto_redirect = true,
+        .event_handler = http_event_handler,
+        .user_data = &hdrs,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
@@ -244,6 +365,12 @@ static void play_one(const play_request_t *req)
         set_stats_locked(PLAYER_STATE_ERROR, NULL);
         return;
     }
+
+    /* Asks the server to interleave StreamTitle metadata into the
+     * audio stream (see icy_meta.h) - most Icecast/Shoutcast stations
+     * honor this; ones that don't simply omit icy-metaint from the
+     * response, which icy_meta_init() treats as pass-through. */
+    esp_http_client_set_header(client, "Icy-Metadata", "1");
 
     /* Declared up front (NULL) so the early stop-check below can safely
      * jump to `stopped:`, which frees/closes all three - a goto that
@@ -259,6 +386,7 @@ static void play_one(const play_request_t *req)
         if (s_stop_requested) {
             goto stopped;
         }
+        memset(&hdrs, 0, sizeof(hdrs)); /* only this iteration's response should count */
         esp_err_t err = esp_http_client_open(client, 0);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "HTTP open failed: %s", esp_err_to_name(err));
@@ -302,11 +430,9 @@ static void play_one(const play_request_t *req)
         /* Many "stream URLs" from radio directories are actually
          * .m3u/.pls playlist wrappers rather than an HTTP-level redirect. */
         if (status >= 200 && status < 300) {
-            char *content_type = NULL;
-            esp_http_client_get_header(client, "Content-Type", &content_type);
-            bool is_playlist = content_type != NULL &&
-                (str_contains_nocase(content_type, "mpegurl") ||
-                 str_contains_nocase(content_type, "scpls"));
+            bool is_playlist = hdrs.content_type[0] != '\0' &&
+                (str_contains_nocase(hdrs.content_type, "mpegurl") ||
+                 str_contains_nocase(hdrs.content_type, "scpls"));
 
             if (is_playlist) {
                 char playlist_buf[1024];
@@ -318,7 +444,7 @@ static void play_one(const play_request_t *req)
                 }
                 playlist_buf[total] = '\0';
                 esp_http_client_close(client);
-                ESP_LOGI(TAG, "Got a playlist (%s), looking for a stream URL inside it", content_type);
+                ESP_LOGI(TAG, "Got a playlist (%s), looking for a stream URL inside it", hdrs.content_type);
 
                 char *found_url = NULL;
                 char *line = strtok(playlist_buf, "\r\n");
@@ -358,6 +484,20 @@ static void play_one(const play_request_t *req)
         return;
     }
 
+    /* Station-level ICY headers (static for the life of this connection)
+     * and the in-stream metadata interval, if the station supports it -
+     * already captured by http_event_handler as the final response's
+     * headers streamed in (see http_headers_t's comment for why we don't
+     * use esp_http_client_get_header() for these). */
+    int metaint = hdrs.icy_metaint;
+    set_station_info_locked(hdrs.icy_name[0] ? hdrs.icy_name : NULL,
+                             hdrs.icy_genre[0] ? hdrs.icy_genre : NULL, hdrs.icy_br);
+    ESP_LOGI(TAG, "ICY: name='%s' genre='%s' br=%d metaint=%d",
+              hdrs.icy_name, hdrs.icy_genre, hdrs.icy_br, metaint);
+
+    icy_meta_ctx_t icy_ctx;
+    icy_meta_init(&icy_ctx, metaint, on_icy_title, NULL);
+
     log_heap_snapshot("before open");
 
     http_buf = malloc(HTTP_READ_BUF_SIZE);
@@ -372,7 +512,14 @@ static void play_one(const play_request_t *req)
         goto fail_alloc;
     }
 
+    /* Format sniffing runs on raw bytes before filtering - safe, since a
+     * real metaint is always far larger (typically 8-16KB) than this
+     * first ~2KB read, so nothing but pure audio has arrived yet. */
     stream_format_t fmt = sniff_stream_format(http_buf, (size_t)sniff_len);
+
+    size_t sniff_audio_len = 0;
+    icy_meta_process(&icy_ctx, http_buf, (size_t)sniff_len, http_buf, &sniff_audio_len);
+    sniff_len = (int)sniff_audio_len;
 
     esp_aac_dec_cfg_t aac_cfg = { .aac_plus_enable = true };
     esp_audio_simple_dec_cfg_t dec_cfg = { .use_frame_dec = false };
@@ -413,9 +560,17 @@ static void play_one(const play_request_t *req)
     uint64_t last_yield_us = stream_start_us;
     int read_err_count = 0;
     const int MAX_READ_ERRORS = 5;
+    int decode_err_count = 0;
+    const int MAX_DECODE_ERRORS = 20; /* transient (network-jitter-induced) bad frames are
+                                        * tolerated; this many in a row means something's
+                                        * genuinely wrong, not just an occasional glitch. */
+    bool resyncing = false; /* true after a decode error, until a real frame sync word is found again */
 
     /* The sniff read above already consumed real stream bytes - feed them
-     * in first or every station silently drops its first ~2KB. */
+     * in first or every station silently drops its first ~2KB. A
+     * failure here IS treated as fatal (unlike in the main loop below) -
+     * if the very first frame won't decode, the format was likely
+     * misdetected, which isn't something retrying will fix. */
     aret = feed_decode_buffer(decoder, http_buf, (size_t)sniff_len, out_buf,
                                &total_decode_us, &total_decoded_bytes, &info, &info_captured, fmt, &adts);
     if (aret != ESP_AUDIO_ERR_OK) {
@@ -440,11 +595,55 @@ static void play_one(const play_request_t *req)
         }
         read_err_count = 0;
 
-        aret = feed_decode_buffer(decoder, http_buf, (size_t)rlen, out_buf,
+        size_t audio_len = 0;
+        icy_meta_process(&icy_ctx, http_buf, (size_t)rlen, http_buf, &audio_len);
+        if (audio_len == 0) {
+            continue; /* chunk was entirely (or started with) a metadata block */
+        }
+
+        uint8_t *feed_ptr = http_buf;
+        if (resyncing) {
+            int sync_off = find_sync_word(feed_ptr, audio_len, fmt);
+            if (sync_off < 0) {
+                /* No sync word anywhere in this chunk - discard it whole
+                 * and keep looking in the next one, rather than feeding
+                 * the decoder bytes we already know aren't a frame start. */
+                continue;
+            }
+            feed_ptr += sync_off;
+            audio_len -= (size_t)sync_off;
+            resyncing = false;
+            ESP_LOGI(TAG, "Resynced after %d byte(s)", sync_off);
+        }
+
+        aret = feed_decode_buffer(decoder, feed_ptr, audio_len, out_buf,
                                    &total_decode_us, &total_decoded_bytes, &info, &info_captured, fmt, &adts);
         if (aret != ESP_AUDIO_ERR_OK) {
-            goto cleanup;
+            /* A single bad frame - most often a network-jitter-induced
+             * corrupted or misaligned chunk - shouldn't tear down the
+             * whole track. Reopen the decoder (its internal bit-reservoir/
+             * SBR state may now be corrupted, not just the input bytes)
+             * and resync to a real frame boundary before resuming, rather
+             * than feeding the next arbitrary byte offset - which is what
+             * was previously cascading into repeated near-instant
+             * failures every time this path was hit. */
+            ESP_LOGW(TAG, "Decode error %d (tolerated %d/%d), reopening decoder and resyncing",
+                      aret, decode_err_count + 1, MAX_DECODE_ERRORS);
+            if (++decode_err_count >= MAX_DECODE_ERRORS) {
+                ESP_LOGE(TAG, "Too many consecutive decode errors, giving up on this track");
+                goto cleanup;
+            }
+            esp_audio_simple_dec_close(decoder);
+            decoder = NULL;
+            esp_audio_err_t reopen_ret = esp_audio_simple_dec_open(&dec_cfg, &decoder);
+            if (reopen_ret != ESP_AUDIO_ERR_OK) {
+                ESP_LOGE(TAG, "Decoder reopen failed: %d", reopen_ret);
+                goto cleanup;
+            }
+            resyncing = true;
+            continue;
         }
+        decode_err_count = 0;
 
         uint64_t now = esp_timer_get_time();
         if (now - last_report_us >= (REPORT_INTERVAL_MS * 1000ULL)) {

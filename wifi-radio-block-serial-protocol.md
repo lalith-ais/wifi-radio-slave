@@ -73,6 +73,21 @@ Textual, line-oriented protocol between the front panel (ESP32-S3 + TFT + EC11) 
 | `STATUS` | `211 <state> <index> <codec> <bitrate>` |
 | `STATS` | `212-buffer <pct>` / `212-cpu <pct>` / `212-underruns <n>` / `212 uptime <s>` |
 | `INFO` | `213-fw <version>` / `213-heap <bytes>` / `213 spiffs_free <bytes>` |
+| `STREAMINFO` | `214-name <name>` / `214-genre <genre>` / `214-bitrate <kbps>` / `214 now_playing <title>` |
+
+### ICY (in-stream) metadata event
+
+Fires whenever the station embeds a new `StreamTitle` in the stream (i.e. on a song/segment change), for stations that support ICY metadata:
+
+`*620 now playing <title>`
+
+### Format event
+
+Fires exactly once per track, as soon as the decoder confirms the real stream format - useful for a front end to display without scraping console logs:
+
+`*616 format <profile> <rate>hz <channels>ch <bits>bit`
+
+`<profile>` is a free-text classification such as `MP3`, `AAC-LC (or explicit-signalled HE-AAC)`, or `HE-AAC / HE-AACv1 (SBR)` / `HE-AACv2 (SBR+PS)`.
 
 ### System
 

@@ -285,6 +285,21 @@ static void cmd_info(char *args)
     reply(213, "spiffs_free n/a"); /* TODO: no SPIFFS partition mounted yet */
 }
 
+/* ICY station info (name/genre/bitrate, static per-connection) and the
+ * most recent in-stream StreamTitle, if the station supports it and one
+ * has arrived yet. */
+static void cmd_streaminfo(char *args)
+{
+    (void)args;
+    player_stats_t st;
+    stream_player_get_stats(&st);
+
+    reply_more(214, "name %s", st.station_name[0] ? st.station_name : "unknown");
+    reply_more(214, "genre %s", st.station_genre[0] ? st.station_genre : "unknown");
+    reply_more(214, "bitrate %d", st.station_bitrate_kbps);
+    reply(214, "now_playing %s", st.now_playing[0] ? st.now_playing : "unknown");
+}
+
 static void cmd_save(char *args) { (void)args; reply(501, "not implemented - no SPIFFS config store yet"); }
 
 static void cmd_reset(char *args)
@@ -341,6 +356,7 @@ static const cmd_entry_t s_commands[] = {
     { "STATUS",          cmd_status },
     { "STATS",           cmd_stats },
     { "INFO",            cmd_info },
+    { "STREAMINFO",      cmd_streaminfo },
     { "SAVE",            cmd_save },
     { "RESET",           cmd_reset },
     { "FACTORY",         cmd_factory },

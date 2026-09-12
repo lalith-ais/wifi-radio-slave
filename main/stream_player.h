@@ -22,6 +22,15 @@ typedef struct {
     int bits_per_sample;
     double cpu_pct;
     double buffer_pct;
+
+    /* ICY metadata - station_* is static per-connection (from response
+     * headers), now_playing updates whenever an in-stream StreamTitle
+     * block arrives. now_playing[0] == '\0' means nothing parsed yet
+     * (station doesn't support ICY metadata, or none has arrived yet). */
+    char station_name[64];
+    char station_genre[32];
+    int station_bitrate_kbps;
+    char now_playing[192];
 } player_stats_t;
 
 /* Registers the esp_audio_codec decoders and creates the internal queue. */
