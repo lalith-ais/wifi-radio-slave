@@ -14,6 +14,7 @@
 #include "config.h"
 #include "wifi_mgr.h"
 #include "stream_player.h"
+#include "storage.h"
 
 #define FW_VERSION       "0.1.0-bench"
 #define FACTORY_CONFIRM_TIMEOUT_MS 10000
@@ -201,6 +202,31 @@ static void cmd_pl_rename(char *args)
     reply(250, "ok");
 }
 
+static void cmd_pl_save(char *args)
+{
+    (void)args;
+    /* playlist_entry_t and storage_playlist_entry_t have matching
+     * url/name fields but are distinct types (this file's `used` flag
+     * isn't part of the persisted format) - copy rather than assume
+     * layout compatibility. */
+    /* static, not stack-local: ~9.7KB (32 entries x ~304 bytes) would
+     * overflow the CLI task's 4KB stack. Single-threaded command
+     * processing (one line fully handled before the next is read) makes
+     * a static scratch buffer safe here - no concurrent access. */
+    static storage_playlist_entry_t entries[PLAYLIST_MAX_ENTRIES];
+    for (int i = 0; i < s_playlist_count; i++) {
+        strncpy(entries[i].url, s_playlist[i].url, sizeof(entries[i].url) - 1);
+        entries[i].url[sizeof(entries[i].url) - 1] = '\0';
+        strncpy(entries[i].name, s_playlist[i].name, sizeof(entries[i].name) - 1);
+        entries[i].name[sizeof(entries[i].name) - 1] = '\0';
+    }
+    if (storage_save_playlist(entries, s_playlist_count) != ESP_OK) {
+        reply(500, "save failed");
+        return;
+    }
+    reply(250, "ok");
+}
+
 static void cmd_play(char *args)
 {
     int idx = args ? atoi(args) : -1;
@@ -215,6 +241,7 @@ static void cmd_play(char *args)
         return;
     }
     stream_player_play(idx, s_playlist[idx].url, s_playlist[idx].name);
+    storage_save_last_index(idx); /* so the board resumes here after an unplanned reboot */
     reply(220, "accepted");
 }
 
@@ -230,6 +257,7 @@ static void cmd_next_prev(char *args, int delta)
     int idx = st.current_index < 0 ? 0 : st.current_index;
     idx = (idx + delta + s_playlist_count) % s_playlist_count;
     stream_player_play(idx, s_playlist[idx].url, s_playlist[idx].name);
+    storage_save_last_index(idx);
     reply(220, "accepted");
 }
 
@@ -346,6 +374,7 @@ static const cmd_entry_t s_commands[] = {
     { "PL.LIST",         cmd_pl_list },
     { "PL.CLEAR",        cmd_pl_clear },
     { "PL.RENAME",       cmd_pl_rename },
+    { "PL.SAVE",         cmd_pl_save },
     { "PLAY",            cmd_play },
     { "STOP",            cmd_stop },
     { "PAUSE",           cmd_pause },
@@ -426,6 +455,38 @@ static void cli_task(void *arg)
              * the next terminator still resets line_len for the next
              * command. */
         }
+    }
+}
+
+void cli_load_playlist_and_autoplay(void)
+{
+    storage_init(); /* logs its own error and leaves the playlist empty if this fails */
+
+    /* static, not stack-local - see cmd_pl_save's comment. This one runs
+     * on the main task at boot, whose default stack is even smaller
+     * than the CLI task's, and is what actually crashed: reserving
+     * ~9.7KB here overflowed it the moment a real (non-empty) saved
+     * playlist caused the array to actually get written into. */
+    static storage_playlist_entry_t loaded[PLAYLIST_MAX_ENTRIES];
+    int loaded_count = 0;
+    storage_load_playlist(loaded, PLAYLIST_MAX_ENTRIES, &loaded_count);
+
+    s_playlist_count = loaded_count;
+    for (int i = 0; i < loaded_count; i++) {
+        strncpy(s_playlist[i].url, loaded[i].url, sizeof(s_playlist[i].url) - 1);
+        s_playlist[i].url[sizeof(s_playlist[i].url) - 1] = '\0';
+        strncpy(s_playlist[i].name, loaded[i].name, sizeof(s_playlist[i].name) - 1);
+        s_playlist[i].name[sizeof(s_playlist[i].name) - 1] = '\0';
+        s_playlist[i].used = true;
+    }
+
+    int last_idx = storage_load_last_index();
+    if (last_idx >= 0 && last_idx < s_playlist_count) {
+        /* Just queues the request - actual playback starts once the
+         * player task is running post-WiFi-connect, per
+         * stream_player_play()'s queue-based design. No need to wait
+         * for a network connection here. */
+        stream_player_play(last_idx, s_playlist[last_idx].url, s_playlist[last_idx].name);
     }
 }
 

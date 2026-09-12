@@ -25,3 +25,14 @@ void cli_start_task(void);
  * callable from the player task while the CLI task is mid-reply.
  */
 void cli_event(int code, const char *fmt, ...);
+
+/*
+ * Mounts SPIFFS storage, loads any previously-saved playlist (via
+ * PL.SAVE) into the CLI's in-memory playlist, and if a last-played
+ * index was saved, queues it for playback immediately - so the board
+ * resumes whatever was playing before, without waiting for a PLAY
+ * command. Call once at boot, before WiFi connects (queuing playback
+ * doesn't require a network connection yet - see stream_player_play()'s
+ * queue-based design).
+ */
+void cli_load_playlist_and_autoplay(void);

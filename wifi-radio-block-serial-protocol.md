@@ -53,6 +53,7 @@ Textual, line-oriented protocol between the front panel (ESP32-S3 + TFT + EC11) 
 | `PL.LIST` | `210-<index> <name> <url>` (one line per entry) ... `210 end` |
 | `PL.CLEAR` | `250 ok` |
 | `PL.RENAME <index> <name>` | `250 ok` / `404 bad index` |
+| `PL.SAVE` | `250 ok` / `500 save failed` |
 
 ### Playback
 

@@ -17,14 +17,6 @@ static const char *TAG = "main";
  * design decision applies here too, even though this bench build has
  * no real front panel yet.
  */
-/*
- * TEMPORARY bench-test bypass: auto-plays a known-good stream at boot so
- * the decode -> I2S path can be exercised while the CLI is unresponsive.
- * Remove once PL.ADD/PLAY over UART1 are confirmed working - this skips
- * the playlist and CLI entirely.
- */
-#define BENCH_TEST_AUTOPLAY_URL "http://mp3.harmonyfm.de/harmonyfm/hqlivestream.aac"
-
 static void bootstrap_task(void *arg)
 {
     esp_err_t err = wifi_mgr_connect();
@@ -35,11 +27,6 @@ static void bootstrap_task(void *arg)
     }
 
     stream_player_start_task();
-
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Bench-test autoplay: %s", BENCH_TEST_AUTOPLAY_URL);
-        stream_player_play(0, BENCH_TEST_AUTOPLAY_URL, "bench-test");
-    }
 
     ESP_LOGI(TAG, "Bootstrap complete");
     vTaskDelete(NULL);
@@ -56,6 +43,11 @@ void app_main(void)
 
     stream_player_init();
     cli_start_task(); /* up first - responsive even before WiFi connects */
+
+    /* Loads the saved playlist and queues the last-played station for
+     * resume - the actual HTTP connect happens once the player task
+     * starts below, after WiFi connects, so this doesn't need to wait. */
+    cli_load_playlist_and_autoplay();
 
     xTaskCreatePinnedToCore(bootstrap_task, "bootstrap", 4096, NULL, 5, NULL, tskNO_AFFINITY);
 }
