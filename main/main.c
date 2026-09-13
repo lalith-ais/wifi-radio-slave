@@ -21,7 +21,10 @@ static void bootstrap_task(void *arg)
 {
     esp_err_t err = wifi_mgr_connect();
     if (err == ESP_OK) {
-        cli_event(601, "wifi connected");
+        char ssid[33] = {0}, ip[16] = {0};
+        int8_t rssi = 0;
+        wifi_mgr_get_status(ssid, sizeof(ssid), ip, sizeof(ip), &rssi);
+        cli_event(601, "wifi connected %s %d", ip, rssi);
     } else {
         cli_event(602, "wifi failed %d", err);
     }

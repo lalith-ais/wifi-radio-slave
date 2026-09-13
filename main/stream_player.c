@@ -753,6 +753,19 @@ esp_err_t stream_player_play(int index, const char *url, const char *name)
     strncpy(req.url, url, sizeof(req.url) - 1);
     strncpy(req.name, name ? name : "", sizeof(req.name) - 1);
 
+    /* Update current_index synchronously, right now - not just via the
+     * player loop's periodic (~5s) status snapshot. Callers like
+     * NEXT/PREV compute the next index as current_index +/- 1
+     * immediately after calling this; without this update, a second
+     * NEXT/PREV pressed within that 5s window would still read the
+     * *previous* track's index and compute the same "next" index all
+     * over again, appearing to get stuck. */
+    xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
+    s_stats.current_index = index;
+    strncpy(s_stats.current_name, name ? name : "", sizeof(s_stats.current_name) - 1);
+    s_stats.current_name[sizeof(s_stats.current_name) - 1] = '\0';
+    xSemaphoreGive(s_stats_mutex);
+
     s_stop_requested = true; /* nudge any current playback to wind down */
     xQueueOverwrite(s_play_queue, &req);
     return ESP_OK;

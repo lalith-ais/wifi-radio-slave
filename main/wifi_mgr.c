@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "wifi_mgr.h"
 #include "config.h"
+#include "cli.h"
 
 static const char *TAG = "wifi_mgr";
 
@@ -37,6 +38,29 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_retry_num = 0;
         s_connected = true;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+#define RSSI_REPORT_INTERVAL_MS 10000
+
+/*
+ * Pushes *604 rssi events periodically for as long as WiFi is connected -
+ * a live signal-strength reading a front end can show without polling.
+ * Runs forever once started; simply skips reporting while disconnected
+ * rather than exiting, so it resumes automatically after any future
+ * reconnect (once WIFI.CONNECT actually does something).
+ */
+static void rssi_monitor_task(void *arg)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(RSSI_REPORT_INTERVAL_MS));
+        if (!s_connected) {
+            continue;
+        }
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            cli_event(604, "rssi %d", ap_info.rssi);
+        }
     }
 }
 
@@ -84,6 +108,8 @@ esp_err_t wifi_mgr_connect(void)
                                             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                             pdFALSE, pdFALSE,
                                             pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+
+    xTaskCreate(rssi_monitor_task, "rssi_mon", 3072, NULL, 3, NULL);
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "Connected to SSID:%s", CONFIG_WIFI_SSID);

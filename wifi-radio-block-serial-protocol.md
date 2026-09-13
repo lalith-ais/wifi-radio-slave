@@ -39,7 +39,7 @@ Textual, line-oriented protocol between the front panel (ESP32-S3 + TFT + EC11) 
 | Command | Reply | Events fired |
 |---|---|---|
 | `WIFI.SET <ssid> <pass>` | `250 stored` / `501 bad syntax` | — |
-| `WIFI.CONNECT` | `220 connecting` | `*601 wifi connected <ip>` or `*602 wifi failed <rc>` |
+| `WIFI.CONNECT` | `220 connecting` | `*601 wifi connected <ip> <rssi>` or `*602 wifi failed <rc>` |
 | `WIFI.DISCONNECT` | `250 ok` | `*603 wifi disconnected` |
 | `WIFI.STATUS` | `211 <ssid> <ip> <rssi>` | — |
 
@@ -89,6 +89,12 @@ Fires exactly once per track, as soon as the decoder confirms the real stream fo
 `*616 format <profile> <rate>hz <channels>ch <bits>bit`
 
 `<profile>` is a free-text classification such as `MP3`, `AAC-LC (or explicit-signalled HE-AAC)`, or `HE-AAC / HE-AACv1 (SBR)` / `HE-AACv2 (SBR+PS)`.
+
+### Periodic RSSI event
+
+Fires every 10s while connected - a live signal-strength reading for a front end, without needing to poll `WIFI.STATUS`:
+
+`*604 rssi <dBm>`
 
 ### System
 
